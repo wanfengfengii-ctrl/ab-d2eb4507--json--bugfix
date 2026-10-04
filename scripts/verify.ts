@@ -19,12 +19,15 @@ import { validateBatch } from "../src/validation.ts";
  *   2. TypeScript build (strict tsc type-check)
  *   3. recovery safety: valid manifests survive a restart, while corrupt
  *      restored entries (the restore-batch sample, duplicate aliases,
- *      unclosed references) abort the load without leaking raw identifiers
+ *      unclosed references, duplicate JSON member names) abort the load
+ *      without leaking raw identifiers
  *   4. submit/query smoke against the live API, including:
  *      - first submission -> 201, identical retry -> 200 with the same result
  *      - GET returns the stored document
  *      - cross-batch alias stability and per-category isolation
  *      - 409 on conflicting content, 422 on an invalid whole batch
+ *      - 400 on a raw JSON body carrying duplicate object member names, with
+ *        nothing persisted and retry/conflict semantics intact afterwards
  *      - no raw identifier value ever appears in a response
  */
 
@@ -71,6 +74,15 @@ async function postJson(path: string, body: unknown): Promise<{ status: number; 
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
+  });
+  return { status: res.status, json: await res.json() };
+}
+
+async function postRaw(path: string, body: string): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
   });
   return { status: res.status, json: await res.json() };
 }
@@ -210,6 +222,46 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. Duplicate object member names sent as raw JSON text are rejected
+    //    with 400 (the runtime parser would otherwise silently keep one of
+    //    the conflicting values). Nothing lands on disk, the batchId stays
+    //    free for a legal submission, and retry/conflict semantics remain
+    //    unchanged.
+    const dupKeyBatch = "smoke-batch-dupkey";
+    const ambiguous =
+      `{"batchId":"smoke-batch-dupkey","records":[{"recordId":"SMOKE-R1","patientId":"SMOKE-P1","accessionId":"SMOKE-A1","relatedIds":[],"measurements":{"diagnosis":"malignant","diagnosis":"benign"}}]}`;
+    const dupKey = await postRaw("/api/manifests", ambiguous);
+    assert(dupKey.status === 400, `expected 400 for duplicate member names, got ${dupKey.status}`);
+    assert(dupKey.json.error === "duplicate_json_key", "must report the duplicate_json_key rule");
+    assertNoRawLeak("duplicate-key response", dupKey.json);
+    const dupKeyText = JSON.stringify(dupKey.json);
+    assert(
+      !dupKeyText.includes("malignant") && !dupKeyText.includes("benign"),
+      "duplicate-key error must not echo the ambiguous values",
+    );
+    const notStored = await getJson(`/api/manifests/${dupKeyBatch}`);
+    assert(notStored.status === 404, "an ambiguous submission must never be persisted");
+
+    const legalAfterAmbiguous = {
+      batchId: dupKeyBatch,
+      records: [
+        {
+          recordId: "SMOKE-R1",
+          patientId: "SMOKE-P1",
+          accessionId: "SMOKE-A1",
+          relatedIds: [],
+          measurements: { diagnosis: "benign" },
+        },
+      ],
+    };
+    const legalCreated = await postJson("/api/manifests", legalAfterAmbiguous);
+    assert(legalCreated.status === 201, `legal submission after a rejected ambiguous one must create, got ${legalCreated.status}`);
+    assert(legalCreated.json.records[0].measurements.diagnosis === "benign", "legal submission must preserve the benign measurement");
+    assert((await postJson("/api/manifests", legalAfterAmbiguous)).status === 200, "same content still replays");
+    const legalConflict = JSON.parse(JSON.stringify(legalAfterAmbiguous));
+    legalConflict.records[0].measurements.diagnosis = "malignant";
+    assert((await postJson("/api/manifests", legalConflict)).status === 409, "different content still conflicts");
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -337,6 +389,40 @@ async function runRecoverySmoke(): Promise<boolean> {
       }),
     );
     await expectCorruptLoad(danglingDir, "verify-recovery-dangling");
+
+    // 5. Duplicate object member names in a restored entry: the file name is
+    //    bound correctly and every field/format would be valid, but the raw
+    //    JSON text repeats a measurement member. The entry must be diagnosed
+    //    corrupt and fail closed instead of being restored with a silently
+    //    chosen value.
+    const dupKeyDir = mkdtempSync(join(tmpdir(), "verify-recovery-dupkey-"));
+    const dupKeyBatch = validateBatch({
+      batchId: "verify-recovery-dupkey",
+      records: [
+        {
+          recordId: "SMOKE-R1",
+          patientId: "SMOKE-P1",
+          accessionId: "SMOKE-A1",
+          relatedIds: [],
+          measurements: { tumorSizeMm: 11.5 },
+        },
+      ],
+    });
+    const dupKeyManifest = transformBatch(
+      dupKeyBatch,
+      new Aliaser(secret),
+      contentHash(dupKeyBatch),
+    );
+    const dupKeyText = JSON.stringify(dupKeyManifest).replace(
+      '"tumorSizeMm":11.5',
+      '"tumorSizeMm":11.5,"tumorSizeMm":9.9',
+    );
+    assert(
+      dupKeyText.includes('"tumorSizeMm":11.5,"tumorSizeMm":9.9'),
+      "fixture must contain a duplicated measurement member",
+    );
+    await writeFile(join(dupKeyDir, fileNameFor("verify-recovery-dupkey")), dupKeyText);
+    await expectCorruptLoad(dupKeyDir, "verify-recovery-dupkey");
 
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;

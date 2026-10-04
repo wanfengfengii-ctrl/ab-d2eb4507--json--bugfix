@@ -5,6 +5,7 @@ import { transformBatch } from "./transform.ts";
 import { BATCH_ID_PATTERN, validateBatch } from "./validation.ts";
 import { log } from "./log.ts";
 import { ManifestStore } from "./store.ts";
+import { parseUniqueJson, DuplicateJsonKeyError } from "./jsonParse.ts";
 import {
   BatchConflictError,
   ValidationFailed,
@@ -62,8 +63,16 @@ export function createAppServer(deps: ServerDeps) {
       req.on("end", () => {
         if (settled) return;
         try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-        } catch {
+          resolve(parseUniqueJson(Buffer.concat(chunks).toString("utf8")));
+        } catch (err) {
+          if (err instanceof DuplicateJsonKeyError) {
+            // The document is syntactically JSON but its member names are
+            // not unique; accepting it would silently pick one of the
+            // duplicate values. Reject it as a malformed request without
+            // ever touching validation or the store.
+            reject(new HttpError(400, "duplicate_json_key", err.message));
+            return;
+          }
           reject(new HttpError(400, "invalid_json", "request body is not valid JSON"));
         }
       });

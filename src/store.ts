@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
+import { parseUniqueJson, DuplicateJsonKeyError } from "./jsonParse.ts";
 import { log } from "./log.ts";
 
 /**
@@ -110,8 +111,21 @@ export class ManifestStore {
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
-    } catch {
+      parsed = parseUniqueJson(raw);
+    } catch (err) {
+      if (err instanceof DuplicateJsonKeyError) {
+        // Syntactically valid JSON with a duplicated object member name is
+        // ambiguous: the runtime would keep one of the values silently. A
+        // restored entry in that shape is corrupt and must never be served,
+        // not merely re-parsed with a chosen value.
+        return [
+          {
+            code: "duplicate_json_key",
+            path: "$",
+            message: "persisted manifest contains an object with duplicate member names",
+          },
+        ];
+      }
       return [
         { code: "invalid_json", path: "$", message: "persisted manifest is not valid JSON" },
       ];

@@ -145,6 +145,68 @@ test("malformed JSON yields 400 and unknown batch yields 404", async () => {
   assert.equal(health.status, 200);
 });
 
+test("a body with duplicate object member names is rejected 400 and never persisted", async () => {
+  const batchId = "batch-dup-key";
+  // Raw text: measurements.diagnosis appears twice with conflicting values.
+  // The runtime parser would silently keep "benign"; the service must
+  // reject the whole ambiguous document instead.
+  const ambiguous =
+    `{"batchId":${JSON.stringify(batchId)},"records":[` +
+    `{"recordId":"R-1","patientId":"P-1","accessionId":"A-1","relatedIds":[],` +
+    `"measurements":{"diagnosis":"malignant","diagnosis":"benign"}}]}`;
+
+  const { status, json } = await post(ambiguous);
+  assert.equal(status, 400);
+  assert.equal(json.error, "duplicate_json_key");
+  assert.ok(
+    !JSON.stringify(json).includes("malignant") && !JSON.stringify(json).includes("benign"),
+    "error response must not echo the ambiguous values",
+  );
+
+  // Nothing was created or updated.
+  const missing = await fetch(`${baseUrl}/api/manifests/${batchId}`);
+  assert.equal(missing.status, 404);
+
+  // Since the ambiguous request never landed, the first ordinary submission
+  // for this batchId is a fresh create (201, not 409)...
+  const benign = {
+    batchId,
+    records: [
+      {
+        recordId: "R-1",
+        patientId: "P-1",
+        accessionId: "A-1",
+        relatedIds: [],
+        measurements: { diagnosis: "benign" },
+      },
+    ],
+  };
+  const created = await post(benign);
+  assert.equal(created.status, 201);
+  assert.equal(created.json.records[0].measurements.diagnosis, "benign");
+
+  // ...an identical retry still follows the original idempotent semantics...
+  const replayed = await post(benign);
+  assert.equal(replayed.status, 200);
+  assert.deepEqual(replayed.json, created.json);
+
+  // ...and genuinely different content for the same batchId still conflicts.
+  const malignant = JSON.parse(JSON.stringify(benign));
+  malignant.records[0].measurements.diagnosis = "malignant";
+  assert.equal((await post(malignant)).status, 409);
+});
+
+test("duplicate member names nested outside measurements are rejected too", async () => {
+  const topDup = '{"batchId":"batch-dup-top","batchId":"other","records":[]}';
+  assert.equal((await post(topDup)).status, 400);
+
+  const recordDup =
+    '{"batchId":"batch-dup-record","records":[{"recordId":"R-1","recordId":"R-2",' +
+    '"patientId":"P-1","accessionId":"A-1","relatedIds":[],"measurements":{}}]}';
+  assert.equal((await post(recordDup)).status, 400);
+  assert.equal((await fetch(`${baseUrl}/api/manifests/batch-dup-record`)).status, 404);
+});
+
 test("an oversized body is rejected with 413 and still produces a response", async () => {
   const oversized = {
     batchId: "batch-huge",

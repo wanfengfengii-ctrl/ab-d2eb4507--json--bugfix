@@ -189,6 +189,46 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   await assert.rejects(store.load(), CorruptStoreError);
 });
 
+test("recovery: valid-shape JSON with duplicate object member names is corrupt", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-dupkey-"));
+  const batch = validateBatch(validBody("batch-dup-key-restore"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  // The document is otherwise fully contract-valid (correct file-name
+  // binding, formats, aliases, closure) — the ONLY defect is a duplicated
+  // measurement member in the raw persisted text.
+  const fileName = fileNameFor("batch-dup-key-restore");
+  const text = JSON.stringify(manifest).replace(
+    '"tumorSizeMm":12.5',
+    '"tumorSizeMm":12.5,"tumorSizeMm":9.9',
+  );
+  assert.ok(text.includes('"tumorSizeMm":12.5,"tumorSizeMm":9.9'), "test fixture must inject a duplicate key");
+  await writeEntry(dir, fileName, text);
+
+  const store = new ManifestStore(dir);
+  await assert.rejects(store.load(), CorruptStoreError);
+  // Fail closed: never served, never treated as absent-and-recoverable.
+  assert.equal(store.get("batch-dup-key-restore"), undefined);
+});
+
+test("recovery: duplicate top-level member names in an entry are corrupt too", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-dupkey-top-"));
+  const batch = validateBatch(validBody("batch-dup-key-top"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const text = JSON.stringify(manifest).replace(
+    '"batchId":"batch-dup-key-top"',
+    '"batchId":"batch-dup-key-top","contentHash":"' + "f".repeat(64) + '"',
+  );
+  // contentHash now appears twice in the document text.
+  assert.equal((text.match(/"contentHash"/g) ?? []).length, 2);
+  await writeEntry(dir, fileNameFor("batch-dup-key-top"), text);
+
+  const store = new ManifestStore(dir);
+  await assert.rejects(store.load(), CorruptStoreError);
+  assert.equal(store.get("batch-dup-key-top"), undefined);
+});
+
 test("shared manifest contract: field set, formats and scalar measurements", () => {
   const batch = validateBatch(validBody("batch-contract"));
   const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));

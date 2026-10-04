@@ -5,6 +5,7 @@ import { contentHash, canonicalize } from "../src/canonical.ts";
 import { transformBatch } from "../src/transform.ts";
 import { validateBatch } from "../src/validation.ts";
 import { ManifestStore } from "../src/store.ts";
+import { parseUniqueJson, DuplicateJsonKeyError } from "../src/jsonParse.ts";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -250,4 +251,61 @@ test("store: create / replay / conflict semantics, persisted to disk", async () 
   assert.equal(restarted.get("batch-A")?.contentHash, hash1);
   assert.equal((await restarted.create("batch-A", hash1, manifest)).status, "replayed");
   assert.equal((await restarted.create("batch-A", hash2, manifest)).status, "conflict");
+});
+
+test("parseUniqueJson accepts well-formed documents and preserves values/order", () => {
+  const text = JSON.stringify({
+    batchId: "b",
+    records: [
+      { id: "r1", measurements: { a: 1, b: "two", c: false, d: null } },
+    ],
+  });
+  assert.deepEqual(parseUniqueJson(text), JSON.parse(text));
+
+  // Distinct sibling keys that share the same name in different objects
+  // are perfectly legal.
+  const nested = '{"records":[{"measurements":{"diagnosis":"x"}},{"measurements":{"diagnosis":"y"}}]}';
+  assert.doesNotThrow(() => parseUniqueJson(nested));
+
+  // Arrays and scalars parse unchanged.
+  assert.deepEqual(parseUniqueJson('[1, "two", null, true, {}]'), [1, "two", null, true, {}]);
+});
+
+test("parseUniqueJson rejects duplicate object member names at every nesting level", () => {
+  const cases: Array<{ name: string; text: string }> = [
+    { name: "duplicate top-level member", text: '{"batchId":"b","batchId":"c","records":[]}' },
+    {
+      name: "duplicate measurement key (the malignant/benign ambiguity)",
+      text: '{"batchId":"b","records":[{"recordId":"R-1","patientId":"P-1","accessionId":"A-1","relatedIds":[],"measurements":{"diagnosis":"malignant","diagnosis":"benign"}}]}',
+    },
+    {
+      name: "duplicate key nested inside a second record",
+      text: '{"batchId":"b","records":[{"measurements":{"k":1}},{"measurements":{"k":2,"k":3}}]}',
+    },
+    { name: "duplicate key adjacent to a valid sibling", text: '{"a":1,"b":2,"b":3}' },
+    { name: "duplicate keys with array between", text: '{"records":[],"records":[]}' },
+  ];
+  for (const c of cases) {
+    assert.throws(
+      () => parseUniqueJson(c.text),
+      (err: unknown) => err instanceof DuplicateJsonKeyError,
+      c.name,
+    );
+  }
+
+  // Plain syntax errors stay plain SyntaxErrors, not duplicate-key errors.
+  assert.throws(() => parseUniqueJson("{not json"), SyntaxError);
+  assert.throws(() => parseUniqueJson('{"a":'), SyntaxError);
+});
+
+test("parseUniqueJson duplicate detection never echoes the conflicting values", () => {
+  const text =
+    '{"batchId":"b","records":[{"recordId":"SECRET-R","recordId":"SECRET-R2","patientId":"P-1","accessionId":"A-1","relatedIds":[],"measurements":{}}]}';
+  try {
+    parseUniqueJson(text);
+    assert.fail("duplicate member names must be rejected");
+  } catch (err) {
+    const message = (err as Error).message;
+    assert.ok(!message.includes("SECRET-R"), "parser error must not contain key/value text");
+  }
 });
