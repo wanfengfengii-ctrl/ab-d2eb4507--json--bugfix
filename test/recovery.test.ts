@@ -189,6 +189,75 @@ test("recovery: syntactically broken JSON entries abort startup too", async () =
   await assert.rejects(store.load(), CorruptStoreError);
 });
 
+test("recovery: duplicate object members in a persisted entry are corrupt and fail closed", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-dup-member-"));
+
+  // Build a contract-valid manifest through the real write path so the file
+  // name binding, alias formats, timestamp and hash are all legitimate, then
+  // splice a duplicate "diagnosis" member into the persisted JSON text.
+  const batchId = "batch-dup-member";
+  const batch = validateBatch({
+    batchId,
+    records: [
+      {
+        recordId: "R-1",
+        patientId: "PAT-1",
+        accessionId: "ACC-1",
+        relatedIds: [],
+        measurements: { diagnosis: "benign" },
+      },
+    ],
+  });
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const validText = JSON.stringify(manifest);
+  const tampered = validText.replace(
+    '"diagnosis":"benign"',
+    '"diagnosis":"malignant","diagnosis":"benign"',
+  );
+  assert.ok(tampered !== validText, "test fixture must contain the duplicated member");
+  await writeEntry(dir, fileNameFor(batchId), tampered);
+
+  // A healthy neighbor entry must not mask the corruption.
+  const healthy = validateBatch(validBody("batch-healthy-neighbor"));
+  const healthyHash = contentHash(healthy);
+  const other = new ManifestStore(dir);
+  await other.create(
+    healthy.batchId,
+    healthyHash,
+    transformBatch(healthy, new Aliaser(SECRET), healthyHash),
+  );
+
+  const restarted = new ManifestStore(dir);
+  let failure: unknown;
+  try {
+    await restarted.load();
+  } catch (err) {
+    failure = err;
+  }
+  assert.ok(failure instanceof CorruptStoreError, "duplicate-member entry must abort the load");
+  assert.deepEqual((failure as InstanceType<typeof CorruptStoreError>).files, [
+    fileNameFor(batchId),
+  ]);
+
+  // The entry is never served, nor admitted so that it could be overwritten.
+  assert.equal(restarted.get(batchId), undefined);
+});
+
+test("recovery: a unique-member valid persisted manifest still loads after restart", async () => {
+  // Guards against the strict parser rejecting ordinary write-path output.
+  const dir = mkdtempSync(join(tmpdir(), "manifest-recovery-unique-"));
+  const batch = validateBatch(validBody("batch-unique-restart"));
+  const hash = contentHash(batch);
+  const manifest = transformBatch(batch, new Aliaser(SECRET), hash);
+  const first = new ManifestStore(dir);
+  assert.equal((await first.create(batch.batchId, hash, manifest)).status, "created");
+
+  const restarted = new ManifestStore(dir);
+  await restarted.load();
+  assert.deepEqual(restarted.get(batch.batchId), manifest);
+});
+
 test("shared manifest contract: field set, formats and scalar measurements", () => {
   const batch = validateBatch(validBody("batch-contract"));
   const good = transformBatch(batch, new Aliaser(SECRET), contentHash(batch));

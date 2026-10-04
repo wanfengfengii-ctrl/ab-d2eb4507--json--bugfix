@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { SharedManifest, ValidationIssue } from "./types.ts";
 import { CorruptManifestError } from "./types.ts";
 import { validateSharedManifest } from "./sharedValidation.ts";
+import { parseStrictJson, StrictJsonError } from "./strictJson.ts";
 import { log } from "./log.ts";
 
 /**
@@ -18,13 +19,13 @@ import { log } from "./log.ts";
  * Recovery is fail-closed: a data volume may have been restored from a
  * backup, migrated from an older version or logically corrupted, so every
  * persisted entry is re-validated against the full current shared-manifest
- * contract (structure, alias/hash/timestamp formats, scalar measurements,
- * record-alias uniqueness, reference closure and the file-name <-> batchId
- * binding) before it is trusted. Any corrupt entry is reported via
- * diagnostics that contain only the hashed file name, rule codes and JSON
- * paths — never file contents — and aborts startup. A corrupt entry is
- * therefore never served by GET and never treated as absent, so a batchId
- * with a corrupt entry cannot be silently overwritten either.
+ * contract (structure, unique JSON object member names, alias/hash/timestamp
+ * formats, scalar measurements, record-alias uniqueness, reference closure
+ * and the file-name <-> batchId binding) before it is trusted. Any corrupt
+ * entry is reported via diagnostics that contain only the hashed file name,
+ * rule codes and JSON paths — never file contents — and aborts startup. A
+ * corrupt entry is therefore never served by GET and never treated as absent,
+ * so a batchId with a corrupt entry cannot be silently overwritten either.
  */
 
 export type CreateOutcome =
@@ -110,8 +111,20 @@ export class ManifestStore {
 
     let parsed: unknown;
     try {
-      parsed = JSON.parse(raw);
-    } catch {
+      // Strict parsing: a persisted object with duplicate member names is
+      // ambiguous (a reader cannot know which value is authoritative) and must
+      // be treated as corrupt, not silently collapsed to one value.
+      parsed = parseStrictJson(raw);
+    } catch (err) {
+      if (err instanceof StrictJsonError && err.code === "duplicate_json_member") {
+        return [
+          {
+            code: "duplicate_json_member",
+            path: err.path,
+            message: "persisted manifest contains a JSON object with duplicate member names",
+          },
+        ];
+      }
       return [
         { code: "invalid_json", path: "$", message: "persisted manifest is not valid JSON" },
       ];

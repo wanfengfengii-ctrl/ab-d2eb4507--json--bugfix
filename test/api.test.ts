@@ -145,6 +145,94 @@ test("malformed JSON yields 400 and unknown batch yields 404", async () => {
   assert.equal(health.status, 200);
 });
 
+test("ambiguous duplicate JSON members reject the whole batch with 400 and persist nothing", async () => {
+  // Raw text on purpose: a JS object literal cannot carry duplicate members.
+  // measurements.diagnosis is written twice, "malignant" then "benign".
+  const ambiguous =
+    '{"batchId":"batch-ambiguous","records":[' +
+    '{"recordId":"R-1","patientId":"P-1","accessionId":"A-1","relatedIds":[],' +
+    '"measurements":{"diagnosis":"malignant","diagnosis":"benign"}}]}';
+
+  const { status, json } = await post(ambiguous);
+  assert.equal(status, 400);
+  assert.equal(json.error, "duplicate_json_member");
+  assert.equal(json.path, "$.records[0].measurements.diagnosis");
+  // The diagnostic must not pick (or echo) either competing value.
+  assert.ok(!JSON.stringify(json).includes("malignant"));
+  assert.ok(!JSON.stringify(json).includes("benign"));
+
+  // Nothing was created or updated: the batch is absent, so the first plain
+  // (unique-member) submission for the same batchId is a genuine 201 create
+  // rather than a 200 replay of the silently chosen value.
+  const missing = await fetch(`${baseUrl}/api/manifests/batch-ambiguous`);
+  assert.equal(missing.status, 404);
+
+  const benign = {
+    batchId: "batch-ambiguous",
+    records: [
+      {
+        recordId: "R-1",
+        patientId: "P-1",
+        accessionId: "A-1",
+        relatedIds: [],
+        measurements: { diagnosis: "benign" },
+      },
+    ],
+  };
+  const created = await post(benign);
+  assert.equal(created.status, 201);
+  assert.equal(created.json.records[0].measurements.diagnosis, "benign");
+
+  // Idempotent replay semantics are unchanged once the batch exists.
+  const replayed = await post(benign);
+  assert.equal(replayed.status, 200);
+  assert.deepEqual(replayed.json, created.json);
+
+  // Same batchId with different content still conflicts.
+  const malignant = JSON.parse(JSON.stringify(benign));
+  malignant.records[0].measurements.diagnosis = "malignant";
+  const conflict = await post(malignant);
+  assert.equal(conflict.status, 409);
+
+  // The ambiguous request can never overwrite the stored benign batch either:
+  // replaying it after the batch exists is still rejected outright (not 409
+  // against the selected value), and the stored copy is untouched.
+  const repeatAmbiguous = await post(ambiguous);
+  assert.equal(repeatAmbiguous.status, 400);
+  const fetched = await fetch(`${baseUrl}/api/manifests/batch-ambiguous`).then((r: any) => r.json());
+  assert.equal(fetched.records[0].measurements.diagnosis, "benign");
+});
+
+test("duplicate member names anywhere in the body are rejected before validation", async () => {
+  const cases: Array<{ name: string; body: string; path: string }> = [
+    {
+      name: "duplicate top-level member",
+      body: '{"batchId":"b","records":[],"records":[]}',
+      path: "$.records",
+    },
+    {
+      name: "duplicate record member",
+      body: '{"batchId":"b","records":[{"recordId":"r","recordId":"s"}]}',
+      path: "$.records[0].recordId",
+    },
+    {
+      name: "duplicate member in a second record",
+      body:
+        '{"batchId":"b","records":[' +
+        '{"recordId":"r1","patientId":"p1","accessionId":"a1","relatedIds":[],"measurements":{}},' +
+        '{"recordId":"r2","patientId":"p2","accessionId":"a2","relatedIds":[],"measurements":{},"measurements":{}}]}',
+      path: "$.records[1].measurements",
+    },
+  ];
+  for (const c of cases) {
+    const { status, json } = await post(c.body);
+    assert.equal(status, 400, c.name);
+    assert.equal(json.error, "duplicate_json_member", c.name);
+    assert.equal(json.path, c.path, c.name);
+  }
+});
+
+
 test("an oversized body is rejected with 413 and still produces a response", async () => {
   const oversized = {
     batchId: "batch-huge",

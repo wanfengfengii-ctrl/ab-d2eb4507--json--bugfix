@@ -3,6 +3,7 @@ import { Aliaser } from "./alias.ts";
 import { contentHash } from "./canonical.ts";
 import { transformBatch } from "./transform.ts";
 import { BATCH_ID_PATTERN, validateBatch } from "./validation.ts";
+import { parseStrictJson, StrictJsonError } from "./strictJson.ts";
 import { log } from "./log.ts";
 import { ManifestStore } from "./store.ts";
 import {
@@ -62,8 +63,16 @@ export function createAppServer(deps: ServerDeps) {
       req.on("end", () => {
         if (settled) return;
         try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-        } catch {
+          // Strict parsing enforces unique object member names: JSON.parse would
+          // silently keep the last duplicate value, accepting an ambiguous
+          // manifest. Duplicate members reject the whole request (400) before
+          // validation or persistence.
+          resolve(parseStrictJson(Buffer.concat(chunks).toString("utf8")));
+        } catch (err) {
+          if (err instanceof StrictJsonError) {
+            reject(err);
+            return;
+          }
           reject(new HttpError(400, "invalid_json", "request body is not valid JSON"));
         }
       });
@@ -142,6 +151,21 @@ export function createAppServer(deps: ServerDeps) {
       sendJson(res, 404, { error: "not_found", message: "route not found" });
     } catch (err) {
       if (res.headersSent) return;
+      if (err instanceof StrictJsonError) {
+        // Duplicate member names (and malformed JSON) are rejected wholesale
+        // before validation: nothing is ever persisted. The diagnostic carries
+        // only the JSON path (member names), never member values.
+        sendJson(res, 400, {
+          error: err.code,
+          message:
+            err.code === "duplicate_json_member"
+              ? "request body contains a JSON object with duplicate member names"
+              : "request body is not valid JSON",
+          path: err.path,
+        });
+        log.warn("manifest_rejected_invalid_json", { code: err.code });
+        return;
+      }
       if (err instanceof ValidationFailed) {
         sendJson(res, 422, { error: "validation_failed", issues: err.issues });
         log.warn("manifest_rejected", { issues: err.issues.length });

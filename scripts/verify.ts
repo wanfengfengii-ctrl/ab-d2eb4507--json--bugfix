@@ -75,12 +75,21 @@ async function postJson(path: string, body: unknown): Promise<{ status: number; 
   return { status: res.status, json: await res.json() };
 }
 
+async function postRaw(path: string, body: string): Promise<{ status: number; json: any }> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body,
+  });
+  return { status: res.status, json: await res.json() };
+}
+
 async function getJson(path: string): Promise<{ status: number; json: any }> {
   const res = await fetch(`${API_BASE_URL}${path}`);
   return { status: res.status, json: await res.json() };
 }
 
-const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST"];
+const RAW_VALUES = ["SMOKE-R1", "SMOKE-R2", "SMOKE-R3", "SMOKE-R8", "SMOKE-R9", "SMOKE-P1", "SMOKE-P2", "SMOKE-P8", "SMOKE-P9", "SMOKE-A1", "SMOKE-A2", "SMOKE-A8", "SMOKE-A9", "DUPVAL", "SMOKE-X", "SMOKE-PX", "SMOKE-PY", "SMOKE-AX", "SMOKE-AY", "GHOST"];
 
 function assertNoRawLeak(label: string, value: unknown): void {
   const text = JSON.stringify(value);
@@ -210,6 +219,64 @@ async function runSmoke(): Promise<boolean> {
     assert(danglingRes.status === 422, `expected 422 for dangling reference, got ${danglingRes.status}`);
     assertNoRawLeak("dangling response", danglingRes.json);
 
+    // 8. Ambiguous duplicate JSON members -> 400, whole batch rejected, nothing
+    //    persisted; later unique-member submissions keep 201/200/409 semantics.
+    const ambiguousBatchId = "smoke-batch-ambiguous";
+    const ambiguous =
+      `{"batchId":"${ambiguousBatchId}","records":[` +
+      '{"recordId":"SMOKE-R8","patientId":"SMOKE-P8","accessionId":"SMOKE-A8","relatedIds":[],' +
+      '"measurements":{"diagnosis":"malignant","diagnosis":"benign"}}]}';
+    const ambiguousRes = await postRaw("/api/manifests", ambiguous);
+    assert(ambiguousRes.status === 400, `expected 400 for duplicate members, got ${ambiguousRes.status}`);
+    assert(
+      ambiguousRes.json.error === "duplicate_json_member",
+      `expected duplicate_json_member, got ${ambiguousRes.json.error}`,
+    );
+    assert(
+      ambiguousRes.json.path === "$.records[0].measurements.diagnosis",
+      `unexpected diagnostic path ${ambiguousRes.json.path}`,
+    );
+    assertNoRawLeak("duplicate-member response", ambiguousRes.json);
+    assert(
+      !JSON.stringify(ambiguousRes.json).includes("malignant") &&
+        !JSON.stringify(ambiguousRes.json).includes("benign"),
+      "duplicate-member response must not echo either competing value",
+    );
+    const ambiguousMissing = await getJson(`/api/manifests/${ambiguousBatchId}`);
+    assert(ambiguousMissing.status === 404, "rejected ambiguous batch must not be stored");
+
+    const benign = {
+      batchId: ambiguousBatchId,
+      records: [
+        {
+          recordId: "SMOKE-R8",
+          patientId: "SMOKE-P8",
+          accessionId: "SMOKE-A8",
+          relatedIds: [],
+          measurements: { diagnosis: "benign" },
+        },
+      ],
+    };
+    const benignCreated = await postJson("/api/manifests", benign);
+    assert(benignCreated.status === 201, `expected 201 after rejection, got ${benignCreated.status}`);
+    assert(
+      (await postJson("/api/manifests", benign)).status === 200,
+      "identical retry must still replay with 200",
+    );
+    const malignant = JSON.parse(JSON.stringify(benign));
+    malignant.records[0].measurements.diagnosis = "malignant";
+    assert(
+      (await postJson("/api/manifests", malignant)).status === 409,
+      "different content for the same batch must still conflict with 409",
+    );
+    // Retrying the ambiguous payload never overwrites the stored batch.
+    assert((await postRaw("/api/manifests", ambiguous)).status === 400, "ambiguous retry must stay 400");
+    const benignFetched = await getJson(`/api/manifests/${ambiguousBatchId}`);
+    assert(
+      benignFetched.json.records[0].measurements.diagnosis === "benign",
+      "the stored batch must remain the benign create",
+    );
+
     process.stdout.write("--- verify: submit/query smoke OK\n");
     return true;
   } catch (err) {
@@ -338,6 +405,33 @@ async function runRecoverySmoke(): Promise<boolean> {
     );
     await expectCorruptLoad(danglingDir, "verify-recovery-dangling");
 
+    // 5. Duplicate object member names in a persisted entry are corrupt: the
+    //    file name is correctly bound and the JSON parses, but the duplicate
+    //    makes the document ambiguous, so startup must fail closed.
+    const dupMemberDir = mkdtempSync(join(tmpdir(), "verify-recovery-dup-member-"));
+    const validDupMemberText = JSON.stringify({
+      batchId: "verify-recovery-dup-member",
+      createdAt: "2026-10-04T00:00:00.000Z",
+      contentHash: "0".repeat(64),
+      records: [
+        {
+          recordAlias: `rec-${"a".repeat(32)}`,
+          patientAlias: `pat-${"b".repeat(32)}`,
+          accessionAlias: `acc-${"c".repeat(32)}`,
+          relatedAliases: [],
+          measurements: { diagnosis: "benign" },
+        },
+      ],
+    });
+    await writeFile(
+      join(dupMemberDir, fileNameFor("verify-recovery-dup-member")),
+      validDupMemberText.replace(
+        '"diagnosis":"benign"',
+        '"diagnosis":"malignant","diagnosis":"benign"',
+      ),
+    );
+    await expectCorruptLoad(dupMemberDir, "verify-recovery-dup-member");
+
     process.stdout.write("--- verify: recovery safety OK\n");
     return true;
   } catch (err) {
@@ -361,6 +455,7 @@ async function main(): Promise<void> {
       "--experimental-strip-types",
       "--test",
       "test/manifest.test.ts",
+      "test/strictJson.test.ts",
       "test/api.test.ts",
       "test/recovery.test.ts",
     ]),
